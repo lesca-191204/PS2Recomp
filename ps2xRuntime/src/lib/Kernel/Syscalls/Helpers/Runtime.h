@@ -1,3 +1,4 @@
+#include <cstdlib>
 static void setRegU32(R5900Context *ctx, int reg, uint32_t value)
 {
     if (!ctx || reg < 0 || reg > 31)
@@ -320,6 +321,10 @@ static void ensureOsdConfigInitialized()
     uint32_t ps1drvConfig = 0;
     uint32_t version = 1;  // OSD2
     uint32_t language = 1; // English
+    // Fork (KZ1 co-op launcher): PS2X_LANGUAGE = the console's language (0 ja, 1 en, 2 fr, 3 es, 4 de, 5 it, 6 nl, 7 pt);
+    // PAL multi-language games pick their text and speech from it.
+    if (const char *lang = std::getenv("PS2X_LANGUAGE"); lang && *lang >= '0' && *lang <= '7')
+        language = static_cast<uint32_t>(*lang - '0');
     g_osd_config_raw = packOsdConfig(spdifMode, screenType, videoOutput, japLanguage, ps1drvConfig, version, language, tz);
     g_osd_config2_raw = packOsdConfig2(0, 0, 0, 0, version, language);
     g_osd_config_initialized = true;

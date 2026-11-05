@@ -518,6 +518,9 @@ namespace ps2_stubs
         }
 
         std::time_t now = std::time(nullptr);
+        // PS2X_DETERMINISTIC=1 (fork, lockstep): every peer reads the same clock (2005-01-01 12:00:00).
+        if (const char *det = std::getenv("PS2X_DETERMINISTIC"); det && det[0] == '1')
+            now = 1104580800;
         std::tm localTm{};
 #ifdef _WIN32
         localtime_s(&localTm, &now);

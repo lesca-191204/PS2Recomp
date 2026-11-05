@@ -10,6 +10,9 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+extern std::atomic<int> g_ps2KickProbe;
+bool ps2GsMuteListFor(uint32_t base, uint32_t &lo, uint32_t &hi);
+extern std::atomic<uint32_t> g_ps2ViewStarts;
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -1138,6 +1141,8 @@ uint32_t PS2Memory::read32(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            if (ps2Vif1DetBarrierReads())
+                ps2Vif1Barrier(Vif1BarrierReason::GifStat); // fork: FINISH/SIGNAL come from the worker
             uint64_t val = gs_regs.csr.load();
             return (uint32_t)(val >> (off * 8));
         }
@@ -1185,6 +1190,8 @@ uint64_t PS2Memory::read64(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            if (ps2Vif1DetBarrierReads())
+                ps2Vif1Barrier(Vif1BarrierReason::GifStat); // fork
             return gs_regs.csr.load();
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -1661,9 +1668,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
         // vif1_regs and the VIF1/PATH3 state are owned by the VIF1 worker while it has work.
-        if (address != 0x10003C00u && address != 0x10003C20u)
-            ps2Vif1Barrier(Vif1BarrierReason::VifRegister);
-
+        // fork (deterministic threaded mode): the write is queued behind the worker's jobs instead of waiting for them
+        // (one such write per frame part made the EE wait for the whole VU1 job; guest reads of this state are barriers).
+        auto apply = [this, address, value]()
+        {
         switch (address)
         {
         case 0x10003C10u:     // VIF1_FBRST
@@ -1724,6 +1732,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         default:
             break;
         }
+        };
+        if (address == 0x10003C00u || address == 0x10003C20u)
+            apply();
+        else if (!(ps2Vif1DetBarrierReads() && ps2Vif1PostCall(apply)))
+        {
+            ps2Vif1Barrier(Vif1BarrierReason::VifRegister);
+            apply();
+        }
 
         return true;
     }
@@ -1783,6 +1799,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 uint32_t chcr = value;
                 uint32_t mode = (chcr >> 2) & 0x3;
 
+                if (g_ps2KickProbe.load(std::memory_order_relaxed) > 0 && (channelBase == 0x10009000u || channelBase == 0x1000A000u))
+                {
+                    g_ps2KickProbe.fetch_sub(1, std::memory_order_relaxed);
+                    std::fprintf(stderr, "[kickprobe] ch=%x mode=%u madr=%x qwc=%u tadr=%x\n", channelBase, mode, madr, qwc,
+                                 m_ioRegisters[channelBase + 0x30]);
+                }
                 if (mode == 0 && qwc > 0)
                 {
                     enqueueTransfer(madr, qwc);
@@ -1871,6 +1893,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+                    // Fork (KZ1 co-op): the guest marks a range of its display list (g_ps2GsMuteList, physical addresses of the
+                    // list buffer this chain starts in): the GS output of the tags stored there is dropped.
+                    uint32_t muteLo = 0u, muteHi = 0u;
+                    const bool findViews = channelBase == 0x10009000u && ps2GsMuteListFor(tagAddr & 0x01FFFFFFu, muteLo, muteHi);
+                    const uint32_t listBase = tagAddr & 0x01FFFFFFu;
+                    uint32_t viewStarts = 0u, gsMuteBegin = 0u, gsMuteEnd = 0u;
+                    bool inMute = false;
 
                     while (tagsProcessed < kMaxChainTags)
                     {
@@ -1980,6 +2009,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
+                        if (findViews && !tagInSPR)
+                        {
+                            const uint32_t phys = currentTagAddr & 0x01FFFFFFu;
+                            if (phys >= listBase && phys < listBase + 0xC0000u) // tags of the list buffer itself (not CALLed blocks)
+                            {
+                                const bool m = phys >= muteLo && phys < muteHi;
+                                if (m && !inMute && gsMuteBegin == 0u)
+                                {
+                                    gsMuteBegin = static_cast<uint32_t>(chainBuf.size());
+                                    ++viewStarts;
+                                }
+                                if (!m && inMute && gsMuteEnd == 0u)
+                                    gsMuteEnd = static_cast<uint32_t>(chainBuf.size());
+                                inMute = m;
+                            }
+                        }
                         if (transferTagData)
                         {
                             appendVifTagData(currentTagAddr);
@@ -2029,6 +2074,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         pt.fromScratchpad = false;
                         pt.srcAddr = 0;
                         pt.qwc = 0;
+                        if (findViews)
+                        {
+                            g_ps2ViewStarts.store(viewStarts, std::memory_order_relaxed);
+                            static int muteLog = std::getenv("KZ_COOP_MUTELOG") ? std::atoi(std::getenv("KZ_COOP_MUTELOG")) : 0;
+                            if (muteLog > 0)
+                            {
+                                --muteLog;
+                                std::fprintf(stderr, "[mutelog] base %x range %x-%x bytes %u-%u of %zu\n", listBase, muteLo, muteHi,
+                                             gsMuteBegin, gsMuteEnd, chainBuf.size());
+                            }
+                            if (gsMuteBegin != 0u)
+                            {
+                                pt.gsMuteBegin = gsMuteBegin;
+                                pt.gsMuteEnd = gsMuteEnd != 0u ? gsMuteEnd : static_cast<uint32_t>(chainBuf.size());
+                            }
+                        }
                         pt.chainData = std::move(chainBuf);
                         if (channelBase == 0x1000A000)
                         {
@@ -2523,7 +2584,10 @@ void PS2Memory::processPendingTransfers()
     {
         if (!p.chainData.empty())
         {
+            m_vif1GsMuteBegin = p.gsMuteBegin;
+            m_vif1GsMuteEnd = p.gsMuteEnd;
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            m_vif1GsMuteBegin = m_vif1GsMuteEnd = 0u;
         }
         else if (p.qwc > 0)
         {
@@ -2666,10 +2730,95 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         m_gifArbiter->drain();
 }
 
+// Fork (KZ1 co-op, kz_coop.cpp): count of GIF packets submitted, and a switch that drops them (the guest sees nothing:
+// only the host GS misses those draws). Used to keep one PC's screen on its own player's view.
+std::atomic<uint32_t> g_ps2GifSubmits{0};
+std::atomic<bool> g_ps2GsMute{false};
+std::atomic<int> g_ps2KickProbe{0}; // fork: log that many VIF1/GIF DMA starts (kz_coop KZ_COOP_GSPROBE)
+// Fork (KZ1 co-op): 1 = in each VIF1 chain, drop the GS output of the second view (from its start block to the END tag).
+// The VIF/VU1 still process every byte (same guest-visible state); only the host GS skips those draws.
+std::atomic<uint32_t> g_ps2ViewStarts{0};  // 1 when the last VIF1 chain had a muted range (diagnostics)
+// Ranges [lo, hi) of display list tag addresses (physical) to mute, two entries (double-buffered lists). Written by the
+// guest thread before the list is kicked, read when the chain is walked (same thread in deterministic mode).
+std::atomic<uint32_t> g_ps2GsMuteList[2][2] = {};
+bool ps2GsMuteListFor(uint32_t base, uint32_t &lo, uint32_t &hi)
+{
+    for (auto &r : g_ps2GsMuteList)
+    {
+        const uint32_t l = r[0].load(std::memory_order_relaxed), h = r[1].load(std::memory_order_relaxed);
+        if (h > l && l >= base && l < base + 0xC0000u) // KZ1's two list buffers are 0xC0100 bytes apart
+        {
+            lo = l;
+            hi = h;
+            // One use: a list sent without a new range (pause menu, loading: no player view loop) is not touched.
+            r[1].store(0, std::memory_order_relaxed);
+            r[0].store(0, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+std::atomic<bool> g_ps2GsMuteRange{false}; // set while processVIF1Data is inside the muted bytes
+std::atomic<bool> g_ps2MuteSkip{false};     // true: the muted bytes are not processed by VIF1 at all
+
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16)
         return;
+    g_ps2GifSubmits.fetch_add(1, std::memory_order_relaxed);
+    if (g_ps2GsMute.load(std::memory_order_relaxed))
+        return;
+    // Fork (KZ1 co-op): inside the hidden view's part of the display list, keep everything the GS stores (textures,
+    // CLUTs, registers) and only stop drawing: the vertex registers that kick a primitive (XYZ2, XYZF2) become their
+    // no-kick twins (XYZ3, XYZF3). Dropping whole packets lost texture uploads the game's VRAM cache counts on.
+    static thread_local std::vector<uint8_t> noDraw;
+    if (g_ps2GsMuteRange.load(std::memory_order_relaxed))
+    {
+        noDraw.assign(data, data + sizeBytes);
+        uint8_t *p = noDraw.data();
+        auto fixReg = [](uint32_t r) -> uint32_t { return r == 0x5u ? 0xDu : r == 0x4u ? 0xCu : r; };
+        uint32_t off = 0;
+        while (off + 16u <= sizeBytes)
+        {
+            uint64_t lo, hi;
+            std::memcpy(&lo, p + off, 8);
+            std::memcpy(&hi, p + off + 8, 8);
+            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+            const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
+            uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            if (flg <= 1u)
+            {
+                bool hasAd = false;
+                uint64_t regs = 0;
+                for (uint32_t i = 0; i < nreg; ++i)
+                {
+                    const uint32_t r = static_cast<uint32_t>((hi >> (i * 4u)) & 0xFu);
+                    hasAd |= r == 0xEu;
+                    regs |= static_cast<uint64_t>(fixReg(r)) << (i * 4u);
+                }
+                if (nreg < 16u)
+                    regs |= hi & ~((1ull << (nreg * 4u)) - 1u);
+                std::memcpy(p + off + 8, &regs, 8);
+                off += 16u;
+                if (flg == 0u)
+                {
+                    for (uint32_t l = 0; l < nloop && off + 16u <= sizeBytes; ++l)
+                        for (uint32_t i = 0; i < nreg && off + 16u <= sizeBytes; ++i, off += 16u)
+                            if (hasAd && ((hi >> (i * 4u)) & 0xFu) == 0xEu)
+                                p[off + 8] = static_cast<uint8_t>(fixReg(p[off + 8]) == p[off + 8] ? p[off + 8] : fixReg(p[off + 8]));
+                }
+                else
+                    off += ((nloop * nreg + 1u) / 2u) * 16u;
+            }
+            else
+            {
+                off += 16u + nloop * 16u; // IMAGE (textures) and disabled: untouched
+            }
+        }
+        data = noDraw.data();
+    }
     ps2Vif1Barrier(Vif1BarrierReason::GifSubmit); // no-op on the worker itself
 
     if (pathId == GifPathId::Path3)

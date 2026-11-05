@@ -280,6 +280,8 @@ public:
     void run();
     void requestStop();
     void postEvent(EeEvent event);
+    // Fork (KZ1 co-op): an event due at an EE cycle (EE thread only); the threaded VIF1 completion in deterministic mode.
+    void scheduleCycleEvent(uint64_t deadlineCycle, EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;

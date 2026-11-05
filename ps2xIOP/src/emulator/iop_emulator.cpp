@@ -251,6 +251,8 @@ namespace ps2x::iop::detail
 
         // While every thread sleeps, do not skip past the SPU2's next event (DMA progress) or more than maxIdleStep,
         // so its interrupts reach the guest on time.
+        uint64_t idealTotal = 0; // fork: exact IOP clock (runCycles)
+        bool idealInit = false;
         uint64_t limitIdleSkip(uint64_t nextWake) const
         {
             const IopHostSpu2 &spu2 = iopHostSpu2();
@@ -558,7 +560,17 @@ namespace ps2x::iop::detail
                 cpu.gpr[29] = kCallStackBase - 32u;
             }
             cpu.gpr[31] = kCallReturnSentinel;
-            runCpu(cpu, budget);
+            const uint32_t used = runCpu(cpu, budget);
+            if (!cpu.stopped && !cpu.yielded && used >= budget)
+            {
+                static uint32_t reported = 0;
+                if (reported < 50u)
+                {
+                    ++reported;
+                    std::fprintf(stderr, "[IOP] call 0x%x ran out of its %u-instruction budget at pc=0x%x ra=0x%x\n",
+                                 address, budget, cpu.pc, cpu.gpr[31]);
+                }
+            }
             return cpu.gpr[2];
         }
 
@@ -695,7 +707,33 @@ namespace ps2x::iop::detail
                 const char *v = std::getenv("PS2X_IOP_IDLE_FASTPATH");
                 return !(v && v[0] == '0');
             }();
-            if (fastPath && idleUntil != 0 && totalCycles + cycles < idleUntil)
+            // fork (KZ1 co-op, 11-05), deterministic mode: the IOP follows an ideal clock (sum of the cycles it was given).
+            // Every slice overshoots its target (runCpu runs whole blocks) and with the synchronous IOP called for a few
+            // cycles at every EE checkpoint the overshoot added up to 1.074x real time: the SPU2 made 7 % too much sound.
+            // The overshoot is now paid back by the next calls. PS2X_IOP_EXACT_CLOCK=0: off.
+            static const bool exactClock = []() {
+                const char *d = std::getenv("PS2X_DETERMINISTIC");
+                const char *v = std::getenv("PS2X_IOP_EXACT_CLOCK");
+                return d && d[0] == '1' && !(v && v[0] == '0');
+            }();
+            if (exactClock)
+            {
+                if (!idealInit)
+                {
+                    idealInit = true;
+                    idealTotal = totalCycles;
+                }
+                idealTotal += cycles;
+                if (totalCycles >= idealTotal)
+                    return; // still ahead from earlier overshoots
+                if (fastPath && idleUntil != 0 && idealTotal < idleUntil)
+                {
+                    totalCycles = idealTotal;
+                    return;
+                }
+                cycles = idealTotal - totalCycles;
+            }
+            else if (fastPath && idleUntil != 0 && totalCycles + cycles < idleUntil)
             {
                 totalCycles += cycles; // exactly what the idle branch below would do
                 return;

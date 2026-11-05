@@ -2955,6 +2955,29 @@ void PS2Runtime::run()
                       << " threads=" << ee.threads.size() << " vsync=" << m_eeScheduler->currentVSyncTick()
                       << " dma=" << m_memory.dmaStartCount() << " gif=" << m_memory.gifCopyCount()
                       << " gsw=" << m_memory.gsWriteCount() << " vif=" << m_memory.vifWriteCount() << std::endl;
+            {
+                // fork (11-05): the vblank count stopped -> say what every thread waits for (freeze diagnosis)
+                static uint64_t lastVs = ~0ull;
+                const uint64_t vs = m_eeScheduler->currentVSyncTick();
+                if (vs == lastVs)
+                {
+                    extern std::atomic<const char *> g_ps2EeWait, g_ps2WorkerWait;
+                    extern void ps2Vif1DebugState(char *, size_t);
+                    char wb[160];
+                    ps2Vif1DebugState(wb, sizeof(wb));
+                    const char *ew = g_ps2EeWait.load(), *ww = g_ps2WorkerWait.load();
+                    std::cerr << "[stall] vblank " << vs << " not moving. EE waits: " << (ew ? ew : "(none: running or other wait)")
+                              << " | worker: " << (ww ? ww : "(not started)") << " | " << wb << std::endl;
+                    extern void (*g_ps2StallExtra)(char *, size_t);
+                    if (g_ps2StallExtra)
+                    {
+                        char gb[200];
+                        g_ps2StallExtra(gb, sizeof(gb));
+                        std::cerr << "[stall]   " << gb << std::endl;
+                    }
+                }
+                lastVs = vs;
+            }
             if (ps2DmaStatsEnabled())
                 printDmaStatsDelta();
             static const bool dumpThreads = std::getenv("PS2X_HEARTBEAT_THREADS") != nullptr; // debug: guest thread/semaphore table

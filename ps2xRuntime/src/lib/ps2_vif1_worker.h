@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 
 #include <atomic>
 #include <cstdint>
@@ -42,6 +43,10 @@ enum class Vif1BarrierReason : uint8_t
 // (its JIT code is tied to the thread that first runs it, so it must never migrate).
 void ps2Vif1WorkerBind(PS2Runtime &runtime, PS2Memory &memory);
 bool ps2Vif1Active();          // threaded mode is on
+// fork: deterministic threaded mode: guest reads of worker-written state (GS CSR) wait for the worker first
+bool ps2Vif1DetBarrierReads();
+// fork: runs fn on the worker after the queued jobs, without waiting (false: not threaded / already on the worker)
+bool ps2Vif1PostCall(std::function<void()> fn);
 // true: the scheduler waits for the worker at every vblank even if the host's vsync hook orders itself
 // (PS2X_VIF1_VSYNC_SYNC=1; A/B switch).
 bool ps2Vif1ForceVsyncBarrier();

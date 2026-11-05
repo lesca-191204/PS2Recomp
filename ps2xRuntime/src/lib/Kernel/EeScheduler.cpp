@@ -3,6 +3,14 @@
 #include <atomic>
 #include <cstdlib>
 #include "runtime/ee_scheduler.h"
+#include <cstdio>
+extern std::FILE *g_ps2SchedTrace; // fork: defined below (KZ_SCHED_TRACE)
+// fork (KZ1 co-op, 11-05): deterministic idle jumps compare deadlines by cycles only in menus and movies (the game's
+// hooks set these: kz_movies.cpp). Everywhere else the original host-time comparison stays: with cycles everywhere
+// level 1 loaded without its world and crashed (0x3b6248).
+std::atomic<uint64_t> g_ps2LastGameFrameTick{0}; // kz_lockstep: vblank tick of the last game frame (diagnostics)
+std::atomic<uint64_t> g_ps2LastMenuTick{0};      // vblank tick of the last front-end menu page update
+std::atomic<bool> g_ps2InMovie{false};           // inside the game's blocking movie player
 
 #include "ps2_log.h"
 #include "../ps2_iop_post.h"
@@ -35,6 +43,17 @@ namespace
 {
     // Read once at startup. Function-local statics with dynamic initialisers cost a thread-safe-init check (a TLS load)
     // on every call under MSVC, and these functions run at every checkpoint.
+    // PS2X_DETERMINISTIC=1 (fork, KZ1 co-op lockstep): scheduled events (vblank, alarms) become due on their EE cycle
+    // deadline alone; the host deadline only paces (the EE thread still sleeps until it, but a posted event no longer cuts
+    // the sleep short and delivers the due events at a host-timed cycle). PS2X_NO_PACING=1: never sleep (headless tests).
+    const bool g_deterministic = []() {
+        const char *v = std::getenv("PS2X_DETERMINISTIC");
+        return v && v[0] == '1';
+    }();
+    const bool g_noPacing = []() {
+        const char *v = std::getenv("PS2X_NO_PACING");
+        return v && v[0] == '1';
+    }();
     const bool g_wallClockPacing = []() {
         const char *v = std::getenv("PS2X_WALLCLOCK");
         return !(v && v[0] == '0');
@@ -454,6 +473,9 @@ void EeScheduler::run()
                 {
                     SET_GPR_U32(&invocation.context, 29, invocationStackTop());
                 }
+                if (g_ps2SchedTrace)
+                    std::fprintf(g_ps2SchedTrace, "inv pc=%x kind=%u c=%llu\n", invocation.context.pc,
+                                 static_cast<unsigned>(invocation.kind), static_cast<unsigned long long>(m_eeCycle));
                 ps2tl::rec(ps2tl::INV_B, invocation.context.pc, static_cast<uint32_t>(invocation.kind), static_cast<uint32_t>(m_eeCycle));
                 owner->invocations.push_back(std::move(invocation));
             }
@@ -767,6 +789,15 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
+// Fork (KZ1 co-op lockstep): when set, the value recompiled `mfc0 Count` sees comes from this hook instead of the
+// host clock, so a game that times itself with Count stays deterministic (kz_lockstep.cpp sets it).
+uint32_t (*g_ps2Cop0CountHook)(uint64_t eeCycle) = nullptr;
+// Fork (KZ1 co-op): called on the EE executor right before each vblank starts, with the tick about to begin. It may
+// block (netplay joiner waiting for the host's menu input): a deterministic point, unlike a pad read.
+void (*g_ps2VBlankGate)(uint64_t nextTick) = nullptr;
+// Fork: scheduler trace (thread runs, invocations, events with the EE cycle), set by kz_lockstep (KZ_SCHED_TRACE).
+std::FILE *g_ps2SchedTrace = nullptr;
+
 namespace
 {
     // COP0 Count runs at the EE clock (294.912 MHz). Recompiled `mfc0 Count` reads ctx->cop0_count, which nothing
@@ -812,7 +843,8 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
                                   ? g_cachedThread
                                   : currentThread();
     if (self != nullptr)
-        (self->invocations.empty() ? self->context : self->invocations.back().context).cop0_count = static_cast<uint32_t>(wallCycles);
+        (self->invocations.empty() ? self->context : self->invocations.back().context).cop0_count =
+            g_ps2Cop0CountHook ? g_ps2Cop0CountHook(m_eeCycle) : static_cast<uint32_t>(g_deterministic ? m_eeCycle : wallCycles);
 #ifdef PS2X_SCHED_STATS_HOT
     const uint64_t statA0 = g_schedStats.on ? __rdtsc() : 0u;
 #endif
@@ -2083,6 +2115,9 @@ void EeScheduler::makeRunning(GuestThread &item)
     item.status = EeThreadStatus::Running;
     m_currentThreadId = item.id;
     renewTimeSlice();
+    if (g_ps2SchedTrace)
+        std::fprintf(g_ps2SchedTrace, "run %d c=%llu pc=%x\n", item.id, static_cast<unsigned long long>(m_eeCycle),
+                     (item.invocations.empty() ? item.context : item.invocations.back().context).pc);
 }
 
 void EeScheduler::makeDormant(GuestThread &item)
@@ -2261,7 +2296,18 @@ void EeScheduler::processDueDeadlines()
                 return;
             }
 
-            if (now < pacingDeadline)
+            if (now < pacingDeadline && g_deterministic)
+            {
+                if (!g_noPacing)
+                    m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                         { return m_stopRequested.load(std::memory_order_acquire); });
+                if (m_stopRequested.load(std::memory_order_acquire))
+                {
+                    updateNextDeadline();
+                    return;
+                }
+            }
+            else if (now < pacingDeadline)
             {
                 const uint64_t statSleep0 = g_schedStats.on ? __rdtsc() : 0u;
                 ps2tl::rec(ps2tl::SLEEP_B, 0u, 0u, static_cast<uint32_t>(m_eeCycle));
@@ -2287,7 +2333,7 @@ void EeScheduler::processDueDeadlines()
             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
                                               [this, pacedNow](const ScheduledEvent &item)
                                               { return item.deadlineCycle <= m_eeCycle &&
-                                                       item.hostDeadline <= pacedNow; });
+                                                       (g_deterministic || item.hostDeadline <= pacedNow); });
             due.insert(due.end(),
                        std::make_move_iterator(m_deadlines.begin()),
                        std::make_move_iterator(firstFuture));
@@ -2334,6 +2380,9 @@ void EeScheduler::processDueDeadlines()
 
 void EeScheduler::processEvent(const EeEvent &event)
 {
+    if (g_ps2SchedTrace)
+        std::fprintf(g_ps2SchedTrace, "ev %u id=%u v=%llu c=%llu\n", static_cast<unsigned>(event.type), event.id,
+                     static_cast<unsigned long long>(event.value), static_cast<unsigned long long>(m_eeCycle));
     SCHED_STAT(++g_schedStats.events);
     switch (event.type)
     {
@@ -2341,6 +2390,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        if (g_ps2VBlankGate)
+            g_ps2VBlankGate(m_vsyncTick + 1u);
         ++m_vsyncTick;
         ps2tl::rec(ps2tl::VBLANK, static_cast<uint32_t>(m_vsyncTick), 0u, static_cast<uint32_t>(m_eeCycle));
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
@@ -2521,7 +2572,25 @@ void EeScheduler::waitForEvent()
     if (hasTimerDeadline)
     {
         const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
-        if (timerHostDeadline < hostDeadline)
+        // fork (11-05): deterministic mode compares cycles. The host deadline of a scheduled vblank runs ahead of the
+        // wall clock when the guest runs faster than real time (PS2X_NO_PACING), so an EE timer several vblanks away
+        // won the host-time comparison and the idle jump skipped those vblanks: menus and movies advanced one picture
+        // every ~6 vblanks (the co-op menu/cutscene stutter).
+        static const bool idleDbg = std::getenv("PS2X_IDLE_DEBUG") != nullptr;
+        if (idleDbg)
+        {
+            static uint32_t n = 0;
+            if (++n % 50 == 0)
+                std::fprintf(stderr, "[sched] idle: timer in %llu cycles, next deadline in %lld cycles (vblank %llu)\n",
+                             static_cast<unsigned long long>(timerCycles),
+                             m_deadlines.empty() ? -1ll : static_cast<long long>(deadlineCycle - m_eeCycle),
+                             static_cast<unsigned long long>(m_vsyncTick));
+        }
+        static const bool cycleCompareOff = std::getenv("PS2X_DET_IDLE_CYCLES") && *std::getenv("PS2X_DET_IDLE_CYCLES") == '0';
+        const bool byCycles = g_deterministic && !cycleCompareOff &&
+                              (g_ps2InMovie.load(std::memory_order_relaxed) ||
+                               m_vsyncTick <= g_ps2LastMenuTick.load(std::memory_order_relaxed) + 4u);
+        if (byCycles ? (m_deadlines.empty() || m_eeCycle + timerCycles < deadlineCycle) : timerHostDeadline < hostDeadline)
         {
             deadlineCycle = m_eeCycle + timerCycles;
             hostDeadline = timerHostDeadline;
@@ -2529,20 +2598,67 @@ void EeScheduler::waitForEvent()
     }
 
     ps2tl::rec(ps2tl::SLEEP_B, 1u, 0u, static_cast<uint32_t>(m_eeCycle));
-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
-                                               { return !m_events.empty() ||
-                                                        m_stopRequested.load(std::memory_order_acquire); });
+    bool signaled;
+    if (g_deterministic)
+    {
+        // Idle until the next cycle deadline whatever the host threads post meanwhile (they are handled after it).
+        if (!g_noPacing)
+            m_eventCv.wait_until(lock, hostDeadline, [this]()
+                                 { return m_stopRequested.load(std::memory_order_acquire); });
+        signaled = m_stopRequested.load(std::memory_order_acquire);
+        if (g_ps2SchedTrace)
+            std::fprintf(g_ps2SchedTrace, "idle %llu -> %llu\n", static_cast<unsigned long long>(m_eeCycle),
+                         static_cast<unsigned long long>(deadlineCycle));
+    }
+    else
+        signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+                                        { return !m_events.empty() ||
+                                                 m_stopRequested.load(std::memory_order_acquire); });
     ps2tl::rec(ps2tl::SLEEP_E, 1u, signaled ? 1u : 0u, static_cast<uint32_t>(m_eeCycle));
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
         lock.unlock();
+        // fork (KZ1 co-op, 11-05): in deterministic mode the idle jump goes in slices and stops as soon as the
+        // synchronous IOP (run inline by accountCycles, so this is deterministic) posted work for the EE. Jumping the
+        // whole way to the next vblank made every EE -> IOP -> EE round trip (disc reads of the movie streams) cost one
+        // vblank: movies and the menu's background movie showed a new picture only every ~6.5 vblanks (~9 fps).
+        // PS2X_DET_IDLE_SLICE=<EE cycles> (default 1/64 of a 60 Hz vblank; 0 = the old single jump).
+        static const uint64_t idleSlice = []() -> uint64_t {
+            const char *e = std::getenv("PS2X_DET_IDLE_SLICE");
+            return e ? std::strtoull(e, nullptr, 10) : 294912000ull / 60ull / 64ull;
+        }();
+        const uint64_t slice = g_deterministic && idleSlice ? idleSlice : std::numeric_limits<uint32_t>::max();
+        // PS2X_IDLE_STATS=1: every 120 vblanks, the share of EE cycles spent idle (diagnostics)
+        static const bool idleStats = std::getenv("PS2X_IDLE_STATS") != nullptr;
+        if (idleStats)
+        {
+            static uint64_t idleCycles = 0, jumps = 0, lastCycle = 0, lastTick = 0;
+            idleCycles += elapsed;
+            ++jumps;
+            if (m_vsyncTick >= lastTick + 120)
+            {
+                const uint64_t total = m_eeCycle - lastCycle;
+                std::fprintf(stderr, "[sched] vblank %llu: idle %.1f%% of %.1f M cycles, %llu idle jumps\n",
+                             static_cast<unsigned long long>(m_vsyncTick), total ? 100.0 * idleCycles / total : 0.0,
+                             total / 1e6, static_cast<unsigned long long>(jumps));
+                idleCycles = jumps = 0;
+                lastCycle = m_eeCycle;
+                lastTick = m_vsyncTick;
+            }
+        }
         uint64_t remaining = elapsed;
         while (remaining > 0u)
         {
-            const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(remaining, std::numeric_limits<uint32_t>::max()));
+            const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(remaining, slice));
             accountCycles(step);
             remaining -= step;
+            if (remaining && slice != std::numeric_limits<uint32_t>::max())
+            {
+                std::lock_guard relock(m_eventMutex);
+                if (!m_events.empty() || !m_pendingInvocations.empty())
+                    break;
+            }
         }
         m_checkpointPending.store(true, std::memory_order_release);
     }
@@ -2558,6 +2674,11 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
         updateNextDeadline();
     }
     m_eventCv.notify_one();
+}
+
+void EeScheduler::scheduleCycleEvent(uint64_t deadlineCycle, EeEvent event)
+{
+    scheduleEvent(deadlineCycle, std::chrono::steady_clock::now(), event);
 }
 
 void EeScheduler::updateNextDeadline()
@@ -2637,6 +2758,14 @@ void EeScheduler::publishIdleDebugContext()
     {
         publishDebugContext(selected->activeContext());
     }
+}
+
+void ps2SetEeCycleScale(double scale)
+{
+    g_eeCycleScaleAuto = false;
+    g_eeCycleScaleFixed = scale;
+    g_eeCycleScaleQ16.store(scale <= 0.0 ? 0u : static_cast<uint32_t>(std::min(scale, 16.0) * 65536.0), std::memory_order_relaxed);
+    std::fprintf(stderr, "[sched] EE cycle clock scale %.3f (fixed)\n", scale);
 }
 
 void ps2SetVblankPeriodMicros(uint32_t micros)

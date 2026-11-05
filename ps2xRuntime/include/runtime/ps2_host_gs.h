@@ -35,4 +35,6 @@ void ps2FlushQueuedGif();
 // Guest vblank period (default 16667 us, NTSC). The host may raise the vblank rate (e.g. for high refresh output);
 // takes effect from the next scheduled vblank.
 void ps2SetVblankPeriodMicros(uint32_t micros);
+// fork (KZ1 co-op): fixed EE cycle clock scale (as PS2X_EE_CYCLE_SCALE=<f>), before the EE thread runs
+void ps2SetEeCycleScale(double scale);
 uint32_t ps2VblankPeriodMicros();

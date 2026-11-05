@@ -422,10 +422,12 @@ public:
         uint32_t srcAddr = 0;
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
+        uint32_t gsMuteBegin = 0, gsMuteEnd = 0; // fork (KZ1 co-op): chainData bytes whose GS output is dropped
     };
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
+    uint32_t m_vif1GsMuteBegin = 0, m_vif1GsMuteEnd = 0; // fork: muted byte range of the buffer processVIF1Data is on
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
 

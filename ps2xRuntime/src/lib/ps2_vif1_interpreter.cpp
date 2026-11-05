@@ -2,11 +2,14 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_dma_stats.h"
 #include "ps2_vif1_worker.h"
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+extern std::atomic<bool> g_ps2GsMuteRange; // ps2_memory.cpp (fork, KZ1 co-op)
+extern std::atomic<bool> g_ps2MuteSkip;
 
 enum VIFCmd : uint8_t
 {
@@ -898,9 +901,35 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     };
 
     uint32_t pos = 0;
+    const uint32_t muteBegin = m_vif1GsMuteBegin, muteEnd = m_vif1GsMuteEnd;
+    m_vif1GsMuteBegin = m_vif1GsMuteEnd = 0u; // only for this buffer
+    bool muted = false;
+    struct MuteReset
+    {
+        bool &m;
+        ~MuteReset()
+        {
+            if (m)
+                g_ps2GsMuteRange.store(false, std::memory_order_relaxed);
+        }
+    } muteReset{muted};
 
     while (pos + 4 <= sizeBytes)
     {
+        if (muteEnd != 0u)
+        {
+            const bool m = pos >= muteBegin && pos < muteEnd;
+            if (m && m_vif1PendingDirectQwc == 0u && g_ps2MuteSkip.load(std::memory_order_relaxed))
+            {
+                pos = muteEnd; // skip the hidden view's VIFcodes and data (no VU1/GS work for it)
+                continue;
+            }
+            if (m != muted)
+            {
+                muted = m;
+                g_ps2GsMuteRange.store(m, std::memory_order_relaxed);
+            }
+        }
         if (m_vif1PendingDirectQwc != 0u)
         {
             // Continuation of a DIRECT that was cut off at the end of the previous buffer: raw GIF data, no VIFcodes.
